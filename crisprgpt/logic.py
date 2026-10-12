@@ -178,9 +178,13 @@ class gradio_state_machine:
             if self.current_state.isFinal:
                 return self.clear_message()  # flush output and wait for next input.
             if self.current_state.request_user_input:
-                ## special rule: if returned from checkAck state, then fetch user input from cache
-                if _from_ack_state:
-                    user_message = self.memory.get("cached_user_message_before_ack")
+                ## special rule: once the acknowledgement is confirmed, resume
+                ## with the input the user had already given. A rejected
+                ## acknowledgement must wait for the user instead of replaying
+                ## the cache, which would otherwise spin on an empty message.
+                cached = self.memory.get("cached_user_message_before_ack")
+                if _from_ack_state and response.status != "error" and cached is not None:
+                    user_message = cached
                     self.memory["cached_user_message_before_ack"] = None
                 else:
                     return self.clear_message()  # flush output and wait for next input.
@@ -263,9 +267,13 @@ class concurrent_gradio_state_machine:
                     mystate
                 )  # flush output and wait for next input.
             if mystate.current_state.request_user_input:
-                ## special rule: if returned from checkAck state, then fetch user input from cache
-                if _from_ack_state:
-                    user_message = mystate.memory.get("cached_user_message_before_ack")
+                ## special rule: once the acknowledgement is confirmed, resume
+                ## with the input the user had already given. A rejected
+                ## acknowledgement must wait for the user instead of replaying
+                ## the cache, which would otherwise spin on an empty message.
+                cached = mystate.memory.get("cached_user_message_before_ack")
+                if _from_ack_state and response.status != "error" and cached is not None:
+                    user_message = cached
                     mystate.memory["cached_user_message_before_ack"] = None
                 else:
                     return cls.clear_message(
@@ -291,6 +299,12 @@ class EmptyStateFinal(BaseState):
     request_user_input = False
     isFinal = True
     request_message = ""
+
+
+RESPONSE_ACK_NOT_CONFIRMED = (
+    "Not confirmed. Type 'yes' to acknowledge the notice above and continue, "
+    "or start a new chat to change your request."
+)
 
 
 class StateCheckACK(BaseUserInputState):
@@ -333,10 +347,17 @@ class StateCheckACK(BaseUserInputState):
             )
 
     def step(self, user_message, **kwargs):
-        if user_message.lower() in ["y", "yes"]:
+        if user_message.strip().lower() in ["y", "yes"]:
             return Result_ProcessUserInput(status="success"), self.ret
         else:
-            return Result_ProcessUserInput(status="error"), self
+            # Without an explicit response the UI would show nothing at all and
+            # the user would have no idea the input was rejected.
+            return (
+                Result_ProcessUserInput(
+                    status="error", response=RESPONSE_ACK_NOT_CONFIRMED
+                ),
+                self,
+            )
 
 
 def make_check_ack_state(ret):
