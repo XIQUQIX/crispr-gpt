@@ -1,11 +1,32 @@
-import pandas as pd
 from .knockout_sgRNA_selection_constant import *
 from .logic import BaseState, Result_ProcessUserInput, BaseUserInputState
 from llm import OpenAIChat
 from .off_target import OffTarget
-from .apis.parse_sgRNA_library import extract_info, sgRNA_library_reader
-import time
- 
+from .apis.parse_sgRNA_library import (
+    extract_info,
+    sgRNA_library_reader,
+    LibraryNotAvailable,
+)
+
+
+# Meta mode records the chosen Cas system in StateStep1Inquiry; auto mode uses
+# the condensed StateStep1Easy. Either is a valid source.
+SELECTION_STATES = ("StateStep1Inquiry", "StateStep1Easy")
+
+
+def system_already_selected(memory):
+    return any(name in memory for name in SELECTION_STATES)
+
+
+def get_selected_system(memory):
+    for name in SELECTION_STATES:
+        if name in memory:
+            return memory[name].result
+    raise KeyError(
+        "No Cas system has been selected yet; "
+        f"expected one of {SELECTION_STATES} in memory."
+    )
+
 
 class SgRNASelection(BaseUserInputState):
     prompt_process = PROMPT_PROCESS_AGENT1
@@ -72,102 +93,67 @@ class StateStepQuestion(BaseUserInputState):
             )
 
 
-class StateStepReformatted(BaseState):
+DISPLAY_COLUMNS = [
+    "Target Gene Symbol",
+    "CRISPR Mechanism",
+    "sgRNA Sequence",
+    "PAM Sequence",
+    "Exon Number",
+    "sgRNA Cut Position (1-based)",
+    "On-Target Efficacy Score",
+    "Off-Target Rank",
+    "Combined Rank",
+]
+
+
+class _SgRNALookupState(BaseState):
+    """Query the pre-designed library and present the matching guides.
+
+    Subclasses only choose which phrasing of the request to query with.
+    """
+
     prompt_process = PROMPT_PROCESS_AGENT2
     prev_state_name = "SgRNASelection"
-
-    @classmethod
-    def step(cls, user_message, **kwargs):
-        start_time = time.time()
-        response = kwargs["memory"][cls.prev_state_name].result
-        if kwargs["is_automation"]:
-            library = kwargs["memory"]["StateStep1Easy"].result
-        else:
-            library = kwargs["memory"]["StateStep1Inquiry"].result
-        species = response["Species"]
-        df = sgRNA_library_reader.parse_knockout_library(library, species)
-        result_df, download_link = extract_info(
-            response["reformatted_request"], cls.prompt_process, df
-        )
-        print(result_df)
-        end_time = time.time()
-        print("Time taken: ", end_time - start_time)
-        if result_df.empty:
-            return (
-                Result_ProcessUserInput(
-                    response=RESPONSE_STEP_ERROR,
-                ),
-                OffTargetQuestion,
-            )
-        return (
-            Result_ProcessUserInput(
-                status="success",
-                result=result_df,
-                response=download_link
-                + "\n\n"
-                + result_df[
-                    [
-                        "Target Gene Symbol",
-                        "CRISPR Mechanism",
-                        "sgRNA Sequence",
-                        "PAM Sequence",
-                        "Exon Number",
-                        "sgRNA Cut Position (1-based)",
-                        "On-Target Efficacy Score",
-                        "Off-Target Rank",
-                        "Combined Rank",
-                    ]
-                ].to_markdown(index=False),
-            ),
-            OffTargetQuestion,
-        )
-
-
-class StateStepOriginal(BaseState):
-    prompt_process = PROMPT_PROCESS_AGENT2
-    prev_state_name = "SgRNASelection"
+    request_key = None
 
     @classmethod
     def step(cls, user_message, **kwargs):
         response = kwargs["memory"][cls.prev_state_name].result
-        if kwargs["is_automation"]:
-            library = kwargs["memory"]["StateStep1Easy"].result
-        else:
-            library = kwargs["memory"]["StateStep1Inquiry"].result
+        system = get_selected_system(kwargs["memory"])
         species = response["Species"]
-        df = sgRNA_library_reader.parse_knockout_library(library, species)
-        result_df, download_link = extract_info(
-            response["original_request"], cls.prompt_process, df
-        )
-        if result_df.empty:
+
+        try:
+            df = sgRNA_library_reader.parse_knockout_library(system, species)
+        except LibraryNotAvailable as ex:
             return (
-                Result_ProcessUserInput(
-                    response=RESPONSE_STEP_ERROR,
-                ),
+                Result_ProcessUserInput(response=f"{ex}\n{RESPONSE_STEP_ERROR}"),
                 OffTargetQuestion,
             )
+
+        result_df, download_link = extract_info(
+            response[cls.request_key], cls.prompt_process, df
+        )
+        if result_df.empty:
+            return Result_ProcessUserInput(response=RESPONSE_STEP_ERROR), OffTargetQuestion
+
+        table = result_df[DISPLAY_COLUMNS].to_markdown(index=False)
+        body = f"{download_link}\n\n{table}" if download_link else table
         return (
-            Result_ProcessUserInput(
-                status="success",
-                result=result_df,
-                response=download_link
-                + "\n\n"
-                + result_df[
-                    [
-                        "Target Gene Symbol",
-                        "CRISPR Mechanism",
-                        "sgRNA Sequence",
-                        "PAM Sequence",
-                        "Exon Number",
-                        "sgRNA Cut Position (1-based)",
-                        "On-Target Efficacy Score",
-                        "Off-Target Rank",
-                        "Combined Rank",
-                    ]
-                ].to_markdown(index=False),
-            ),
+            Result_ProcessUserInput(status="success", result=result_df, response=body),
             OffTargetQuestion,
         )
+
+
+class StateStepReformatted(_SgRNALookupState):
+    """Query using the request rewritten with the suggested target exons."""
+
+    request_key = "reformatted_request"
+
+
+class StateStepOriginal(_SgRNALookupState):
+    """Query using the user's request exactly as they phrased it."""
+
+    request_key = "original_request"
 
 
 class OffTargetQuestion(BaseUserInputState):
