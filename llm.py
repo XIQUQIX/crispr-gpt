@@ -1,7 +1,4 @@
-from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
-import requests
 import json
 from crisprgpt.safety import WARNING_PRIVACY, contains_identifiable_genes
 from util import get_logger
@@ -11,51 +8,79 @@ import os
 dotenv.load_dotenv()
 logger = get_logger(__name__)
 
+# Model used for each tier. Kept as named constants so the mapping is explicit
+# rather than buried in the call sites.
+MODEL_DEFAULT = "gpt-4o"
+MODEL_TURBO = "gpt-4-turbo"
 
-class FakeChatOpenAI:  ## For debug purpose only
-    def __init__(self, **kwargs):
-        pass
 
-    def __call__(self, inputs):
-        logger.info("FakeChatOpenAI Called")
-        response = input()
-        return AIMessage(content=response)
+class IdentifiableGeneError(ValueError):
+    pass
 
-class IdentifiableGeneError(ValueError): pass
+
+class MissingAPIKeyError(RuntimeError):
+    pass
+
 
 class OpenAIChat:
-    openai_key = os.getenv("OPENAI_KEY") 
+    _cache = {}
 
-    model4_turbo = ChatOpenAI(openai_api_key=openai_key, model_name = 'gpt-4-turbo')
-    model4 = ChatOpenAI(openai_api_key=openai_key, model_name = 'gpt-4o')
-    # model3 = ChatOpenAI(openai_api_key=openai_key, model_name = 'gpt-3.5-turbo-0613')
-    model3 = ChatOpenAI(openai_api_key=openai_key, model_name = 'gpt-4o')
+    @classmethod
+    def _get_model(cls, model_name):
+        """Build (and memoize) a JSON-mode chat model.
 
-    model4_turbo_json = model4_turbo.bind(response_format = {"type": "json_object"})
-    model4_json = model4.bind(response_format = {"type": "json_object"})
-
+        Models are created on first use rather than at import time, so the
+        module can be imported -- and the state machine exercised offline --
+        without an API key being present.
+        """
+        if model_name not in cls._cache:
+            api_key = os.getenv("OPENAI_KEY")
+            if not api_key:
+                raise MissingAPIKeyError(
+                    "OPENAI_KEY is not set. Add it to a .env file in the project "
+                    "root (see README) before running CRISPR-GPT."
+                )
+            model = ChatOpenAI(openai_api_key=api_key, model_name=model_name)
+            cls._cache[model_name] = model.bind(
+                response_format={"type": "json_object"}
+            )
+        return cls._cache[model_name]
 
     @classmethod
     def chat(cls, request, use_GPT4=True, use_GPT4_turbo=False):
+        """Send `request` and parse the reply as JSON.
+
+        Every tier binds JSON response mode; callers always receive a dict.
+        """
         if contains_identifiable_genes(request):
             raise IdentifiableGeneError(WARNING_PRIVACY)
-        if use_GPT4_turbo:
-            response = cls.model4_turbo_json.invoke(request).content
-        elif use_GPT4:
-            response = cls.model4_json.invoke(request).content
-        else:
-            response = cls.model3([HumanMessage(content=request)]).content
+
+        model_name = MODEL_TURBO if use_GPT4_turbo else MODEL_DEFAULT
+        response = cls._get_model(model_name).invoke(request).content
         logger.info(response)
 
-        ## postprocessing
-        response = response.lstrip("```json")
-        response = response.lstrip("```")
-        response = response.rstrip("```")
-        response = response.strip()
+        return cls._parse_json(response)
 
-        json_response = json.loads(response)
-        return json_response
+    @staticmethod
+    def _parse_json(response):
+        """Strip the markdown fence the model sometimes emits, then parse."""
+        response = response.strip()
+        if response.startswith("```"):
+            response = response[3:].removeprefix("json")
+            if response.endswith("```"):
+                response = response[:-3]
+        return json.loads(response.strip())
 
     @classmethod
     def QA(cls, request, use_GPT4=False):
-        return "QA is not supported in the lite version."
+        """Freestyle Q&A.
+
+        The lite release ships without the curated knowledge base and retrieval
+        layer that this mode depends on, so it is unavailable rather than
+        answering from the base model alone.
+        """
+        return (
+            "Q&A mode is not available in the lite version: it depends on the "
+            "curated knowledge base and retrieval layer, which are not included "
+            "in this release."
+        )

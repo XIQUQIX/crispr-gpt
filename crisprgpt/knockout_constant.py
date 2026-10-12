@@ -64,9 +64,10 @@ Response format:
 
 PROMPT_REQUEST_ENTRY = """Now, let's start designing and planning your knockout experiment using CRISPR system, we will go through a step by step process as listed below:
 1. Selecting a CRISPR/Cas system.
-2. Selecting a delivery approach for CRISPR/Cas system. (Not Supported in Lite version)
+2. Selecting a delivery approach for CRISPR/Cas system. (content pending in Lite version)
 3. Designing guideRNA for gene knockout.
-4. Collecting appropriate experimantal protocols and validating the editing outcomes. (Not Supported in Lite version)
+4. Collecting appropriate experimental protocols. (content pending in Lite version)
+5. Validating the editing outcomes and designing sequencing primers. (content pending in Lite version)
 """
 
 PROMPT_STEP1 = """

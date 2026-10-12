@@ -1,7 +1,7 @@
 from .logic import BaseState, Result_ProcessUserInput, BaseUserInputState
 from llm import OpenAIChat, IdentifiableGeneError
-from . import base_editing, knockout, prime_editing, act_rep, off_target
 from .logic import StateFinal, gradio_state_machine, EmptyState, EmptyStateFinal
+from .tasks import render_task_table, resolve, UnknownTask
 
 from dataclasses import dataclass
 from typing import Optional, List
@@ -18,40 +18,16 @@ class ExecutorState:
 
 
 PROMPT_PROCESS_AUTOMATE = """
-Please act as an expert in CRISPR technology. Given the user input, think step by step and generate a list of tasks for execution. First refer to the task description table below, and try to figure out if the user needs to directly jump into a task, or the user needs to complete several tasks. Make sure to respect the task notes.
+Please act as an expert in CRISPR technology. Given the user input, think step by step and generate a list of tasks for execution. First refer to the task description table below, and try to figure out if the user needs to directly jump into a task, or the user needs to complete several tasks. Make sure to respect the task dependencies and include all dependent tasks in the list.
 
-Please do not include unnecessary steps and there are no dependencies within the steps. Please make sure the generated list of tasks are in the order indicated in the task description table. Please format your response and make sure it is parsable by JSON.
+Please make sure the generated list of tasks are in the order indicated in the task description table. Please format your response and make sure it is parsable by JSON.
 
 ## Task Description Table
 
-For knockout
-
-task name: task descriptions: notes
-knockout.StateStep1: Cas System selection for knockout : none
-knockout.StateStep3: guideRNA design for knockout : none
-
-For base editing
-
-task name: task descriptions: notes
-base_editing.StateError: the error-handling state for all tasks about base editing : CRISPR-GPT-Lite version does not support base editing. 
-
-For prime editing
-
-task name: task descriptions: notes
-prime_editing.StateError: the error-handling state for all tasks about prime editing : CRISPR-GPT-Lite version does not support prime editing. 
-
-For CRISPRa/CRISPRi
-
-task name: task descriptions: notes
-act_rep.StateError: the error-handling state for all tasks about CRISPRa/CRISPRi : CRISPR-GPT-Lite version does not support CRISPRa/CRISPRi. 
-
-For Off-Target Prediction
-
-task name: task descriptions: dependency
-off_target.OffTarget: Off-target search/prediction using CRISPRitz: none
+{task_table}
 
 ## Demonstrations:
-If the user only needs to design guideRNA for knockout, then return ['knockout.StateStep3']. Reason: this directly matches knockout.StateStep3.
+If the user only needs to design guideRNA for knockout, then return ['knockout.StateStep1', 'knockout.StateStep3']. Reason: this directly matches knockout.StateStep3. But it needs to complete knockout.StateStep1 first, so both 'knockout.StateStep1' and 'knockout.StateStep3' are returned.
 
 
 User Input:
@@ -62,8 +38,16 @@ Response format:
 
 {{
 "Thoughts": "<thoughts>",
-"Tasks": ["<task1>", "<task2>"]  ## a list of task names 
+"Tasks": ["<task1>", "<task2>"]  ## a list of task names
 }}"""
+
+TASK_TABLE = render_task_table()
+
+RESPONSE_UNKNOWN_TASK = (
+    "Sorry, I could not map your request onto the supported design tasks. "
+    "Please rephrase it, or use Meta-Mode for a guided pipeline."
+)
+
 
 class StateAutomate(BaseUserInputState):
     prompt_process = PROMPT_PROCESS_AUTOMATE
@@ -71,19 +55,44 @@ class StateAutomate(BaseUserInputState):
 
     @classmethod
     def step(cls, user_message, **kwargs):
-        prompt = cls.prompt_process.format(user_message = user_message) 
+        prompt = cls.prompt_process.format(
+            user_message=user_message, task_table=TASK_TABLE
+        )
         response = OpenAIChat.chat(prompt, use_GPT4=True)
-        tasks = response['Tasks']
-        logger.info(tasks)
-        tasks = [eval(x) for x in tasks]
-        tasks.insert(0, EmptyState)
-        tasks.append(EmptyStateFinal) 
-        executor = gradio_state_machine(task_list=tasks) 
-        kwargs['memory']['executor'] = executor
-        executor.memory['flag_human_heritable_editing_ack'] = True  
-        kwargs['memory']['executor_state'] = ExecutorState(user_prompt=user_message, cached_message=[], flag_user_ack = True)
+        logger.info(response["Tasks"])
 
-        return Result_ProcessUserInput(status='success', thoughts= response['Thoughts'] , result=user_message, response=str(response)),  StateAutomateStep
+        try:
+            # Resolve by name against the catalogue. The planner's output is
+            # untrusted text and must never reach eval().
+            tasks = resolve(response["Tasks"])
+        except UnknownTask as ex:
+            logger.info(["Planner returned an unknown task", ex])
+            return (
+                Result_ProcessUserInput(
+                    status="error", response=RESPONSE_UNKNOWN_TASK
+                ),
+                cls,
+            )
+
+        tasks = [EmptyState, *tasks, EmptyStateFinal]
+        executor = gradio_state_machine(task_list=tasks)
+        kwargs["memory"]["executor"] = executor
+        # Carry over whether the heritable-editing notice has already been
+        # shown for this session. Hard-coding True here would let auto mode
+        # bypass a check that is meant to apply to every task.
+        executor.memory["flag_human_heritable_editing_ack"] = kwargs["memory"].get(
+            "flag_human_heritable_editing_ack", False
+        )
+        kwargs["memory"]["executor_state"] = ExecutorState(
+            user_prompt=user_message, cached_message=[], flag_user_ack=True
+        )
+
+        return Result_ProcessUserInput(
+            status="success",
+            thoughts=response["Thoughts"],
+            result=user_message,
+            response=str(response),
+        ), StateAutomateStep
 
 class StateAutomateYesNo(BaseUserInputState):  
     
@@ -150,12 +159,17 @@ class StateAutomateStep(BaseState):
             response = OpenAIChat.chat(prompt, use_GPT4=True) 
             logger.info(response)
             return response 
-        except IdentifiableGeneError as ex:
+        except IdentifiableGeneError:
             logger.info(["Not supported in Automated Mode"])
             return dict(Thoughts="Input/Output may contain sensitive sequences. This is not supported in Automation mode! Please manually enter your response!", Answer="I don't know")
         except Exception as ex:
-            logger.info(["Error occured", ex]) 
-            return dict(Thoughts="error occured" + ex + "Please manually enter your response!", Answer="I don't know")
+            logger.info(["Error occured", ex])
+            # Concatenating the exception object here used to raise a
+            # TypeError of its own, hiding the original failure.
+            return dict(
+                Thoughts=f"An error occurred ({ex}). Please manually enter your response!",
+                Answer="I don't know",
+            )
 
 
 
